@@ -16,10 +16,9 @@ import torch
 from datasets import load_dataset
 from transformers import (
     AutoModelForCausalLM,
-    AutoTokenizer,
-    TrainingArguments,
     BitsAndBytesConfig,
     PreTrainedTokenizerFast,
+    AutoModelForSequenceClassification
 )
 from trl import AutoModelForCausalLMWithValueHead, PPOConfig, PPOTrainer
 from peft import (
@@ -31,6 +30,9 @@ from peft import (
 import random
 from typing import List, Dict
 import numpy as np
+import multiprocessing
+
+num_proc = max(1, multiprocessing.cpu_count() // 2)
 
 class GRPOTrainer:
     """GRPO训练器 - 基于TRL的PPO实现GRPO算法"""
@@ -58,14 +60,7 @@ class GRPOTrainer:
         """设置策略模型、奖励模型和分词器"""
         print("Loading models and tokenizer...")
         
-        # 加载分词器
-        self.tokenizer = PreTrainedTokenizerFast(
-            tokenizer_file=self.tokenizer_path,
-            bos_token="<s>", 
-            pad_token="<pad>", 
-            eos_token="</s>", 
-            unk_token="<unk>"
-        )
+        self.tokenizer = PreTrainedTokenizerFast(tokenizer_file=self.tokenizer_path)
         
         # 配置4bit量化
         bnb_config = BitsAndBytesConfig(
@@ -87,9 +82,8 @@ class GRPOTrainer:
         
         # 加载奖励模型
         print(f"Loading reward model: {self.reward_model_path}")
-        self.reward_model = AutoModelForCausalLM.from_pretrained(
+        self.reward_model = AutoModelForSequenceClassification.from_pretrained(
             self.reward_model_path,
-            quantization_config=bnb_config,
             device_map="auto",
             trust_remote_code=True,
             torch_dtype=torch.bfloat16,
@@ -160,7 +154,8 @@ class GRPOTrainer:
             batched=True,
             batch_size=1000,
             remove_columns=train_dataset.column_names,
-            desc="Processing Alpaca-GPT4 dataset"
+            desc="Processing Alpaca-GPT4 dataset",
+            num_proc=num_proc,  # 使用多进程加速
         )
         
         # 提取查询列表
@@ -311,7 +306,7 @@ class GRPOTrainer:
         # 保存最终模型
         print("Saving GRPO model...")
         self.policy_model.save_pretrained(self.output_dir)
-        self.tokenizer.save_pretrained(self.output_dir)
+        # self.tokenizer.save_pretrained(self.output_dir)
         
         return ppo_trainer
 

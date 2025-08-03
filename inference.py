@@ -1,3 +1,8 @@
+
+# 验证预训练模型的推理能力
+# 2025/8/3
+# wenzhe
+
 import torch
 from transformers import AutoModelForCausalLM, PreTrainedTokenizerFast, AutoTokenizer
 import time

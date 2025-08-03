@@ -1,11 +1,12 @@
 
+# 预处理用于预训练的文本数据集
 # 2025/7/16
 # wenzhe
 
 
 import os
 from datasets import load_dataset, concatenate_datasets, Dataset
-from transformers import GPT2Config, GPT2LMHeadModel, Trainer, TrainingArguments, DataCollatorForLanguageModeling, PreTrainedTokenizerFast
+from transformers import PreTrainedTokenizerFast
 from tokenizers import Tokenizer
 import multiprocessing
 
@@ -14,20 +15,6 @@ output_dir = "./pretrain_data_chunks"
 # num_proc 控制 map 和 flat_map 的并行进程数
 num_proc = max(1, multiprocessing.cpu_count() // 2) # 建议使用 CPU 核数的一半，但对于低内存环境，可能需要设置为更小的值
 # num_proc = 1 # 如果内存非常吃紧，可以先设置为1进行测试
-
-def load_tokenizer(tokenizer_path="tokenizer/byte_level_bpe_tokenizer_v1.json"):
-    """加载自定义分词器并返回PreTrainedTokenizerFast对象"""
-    if not os.path.exists(tokenizer_path):
-        raise FileNotFoundError(f"Tokenizer file not found: {tokenizer_path}")
-    hf_tokenizer = Tokenizer.from_file(tokenizer_path)
-    # 使用HuggingFace的PreTrainedTokenizerFast加载自定义的分词器，使其与training兼容
-    # 后来发现使用AutoTokenizer.from_pretrained也完全可以，真是小丑了
-    tokenizer = PreTrainedTokenizerFast(tokenizer_object=hf_tokenizer)
-    if tokenizer.eos_token_id is None:
-        tokenizer.add_special_tokens({"eos_token": "</s>"})
-    if tokenizer.pad_token_id is None:
-        tokenizer.add_special_tokens({"pad_token": "<pad>"})
-    return tokenizer
 
 def load_and_prepare_datasets(cache_dir="/data2/huggingface/datasets", prepared_path="pretrain_data_chunks/prepared_dataset.arrow"):
     """加载五个数据集并拼接、打乱"""
@@ -109,7 +96,7 @@ def flatten_chunks(examples):
 if __name__ == "__main__":
     print(f"Starting preprocessing with {num_proc} processes.")
     
-    tokenizer = load_tokenizer()
+    tokenizer = PreTrainedTokenizerFast(tokenizer_file="./tokenizer/byte_level_bpe_tokenizer_v1.json")
     print(f"Tokenizer loaded.")
 
     dataset = load_and_prepare_datasets()

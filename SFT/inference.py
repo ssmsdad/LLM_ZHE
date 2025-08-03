@@ -29,19 +29,7 @@ class ChatbotInference:
         )
         
         # 加载分词器
-        if tokenizer_path:
-            # 使用自定义分词器
-            print(f"加载自定义分词器: {tokenizer_path}")
-            self.tokenizer = PreTrainedTokenizerFast(
-                tokenizer_file=tokenizer_path,
-                bos_token="<s>", 
-                pad_token="<pad>", 
-                eos_token="</s>", 
-                unk_token="<unk>"
-            )
-        else:
-            # 使用模型默认分词器
-            self.tokenizer = PreTrainedTokenizerFast.from_pretrained(base_model_name)
+        self.tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_path,)
         
         # 加载基础模型（使用4bit量化）
         self.model = AutoModelForCausalLM.from_pretrained(

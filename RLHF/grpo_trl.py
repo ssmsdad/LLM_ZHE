@@ -19,6 +19,7 @@ from transformers import (
     TrainingArguments,
     BitsAndBytesConfig,
     PreTrainedTokenizerFast,
+    AutoModelForSequenceClassification
 )
 from trl import GRPOTrainer, GRPOConfig
 from peft import (
@@ -29,6 +30,9 @@ from peft import (
 )
 import random
 from typing import Dict, List
+import multiprocessing
+
+num_proc = max(1, multiprocessing.cpu_count() // 2)
 
 class GRPOTrainerTRL:
     """基于TRL GRPOTrainer的强化学习微调"""
@@ -57,13 +61,7 @@ class GRPOTrainerTRL:
         print("Loading model and tokenizer...")
         
         # 加载分词器
-        self.tokenizer = PreTrainedTokenizerFast(
-            tokenizer_file=self.tokenizer_path,
-            bos_token="<s>", 
-            pad_token="<pad>", 
-            eos_token="</s>", 
-            unk_token="<unk>"
-        )
+        self.tokenizer = PreTrainedTokenizerFast(tokenizer_file=self.tokenizer_path)
         
         # 配置4bit量化
         bnb_config = BitsAndBytesConfig(
@@ -103,8 +101,16 @@ class GRPOTrainerTRL:
         
         self.model = get_peft_model(self.model, lora_config)
         self.model.print_trainable_parameters()
+
+        print(f"Loading reward model: {self.reward_model_path}")
+        self.reward_model = AutoModelForSequenceClassification.from_pretrained(
+            self.reward_model_path,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True,
+        )
         
-        print("Model and tokenizer loaded successfully!")
+        print("All Model and tokenizer loaded successfully!")
     
     def prepare_dataset(self, dataset_name="vicgalle/alpaca-gpt4", max_samples=1000):
         """准备GRPO训练数据集 - 适配alpaca-gpt4格式"""
@@ -143,7 +149,8 @@ class GRPOTrainerTRL:
             batched=True,
             batch_size=1000,  # 每批处理1000个样本
             remove_columns=train_dataset.column_names,  # 删除原始列
-            desc="Processing Alpaca-GPT4 dataset"  # 显示进度条
+            desc="Processing Alpaca-GPT4 dataset",  # 显示进度条
+            num_proc=num_proc,  # 使用多进程加速
         )
         
         print(f"Prepared {len(processed_dataset)} training samples")
@@ -151,23 +158,13 @@ class GRPOTrainerTRL:
     
     def create_reward_function(self):
         """创建奖励函数"""
-        print(f"Loading reward model: {self.reward_model_path}")
-        
-        # 加载奖励模型
-        reward_model = AutoModelForCausalLM.from_pretrained(
-            self.reward_model_path,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            trust_remote_code=True,
-        )
         
         def reward_function(prompts: List[str], responses: List[str]) -> List[float]:
-            """计算奖励分数"""
             rewards = []
             
             for prompt, response in zip(prompts, responses):
-                # 组合prompt和response
-                full_text = f"{prompt}\n{response}"
+                # 组合prompt和response，构造完整的对话
+                full_text = f"Instruction: {prompt}\nResponse: {response}"
                 
                 # 分词
                 inputs = self.tokenizer(
@@ -177,12 +174,12 @@ class GRPOTrainerTRL:
                     max_length=self.max_length,
                     padding=True
                 )
-                inputs = {k: v.to(reward_model.device) for k, v in inputs.items()}
+                inputs = {k: v.to(self.reward_model.device) for k, v in inputs.items()}
                 
-                # 计算奖励
+                # 计算奖励分数
                 with torch.no_grad():
-                    outputs = reward_model(**inputs)
-                    # 奖励模型输出logits，取第一个值作为奖励分数
+                    outputs = self.reward_model(**inputs)
+                    # 奖励模型输出单个分数 [batch_size, 1]
                     reward_score = outputs.logits[0, 0].item()
                     rewards.append(reward_score)
             
@@ -256,7 +253,7 @@ class GRPOTrainerTRL:
         # 保存最终模型
         print("Saving GRPO model...")
         trainer.save_model()
-        self.tokenizer.save_pretrained(self.output_dir)
+        # self.tokenizer.save_pretrained(self.output_dir)
         
         return trainer
 

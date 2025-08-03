@@ -10,13 +10,12 @@ import os
 # 设置环境变量
 os.environ['HF_DATASETS_CACHE'] = '/data/wenzhe/huggingface/datasets'
 os.environ['HF_HOME'] = '/data/wenzhe/huggingface'
-import torch
-import torch.nn as nn
 from datasets import load_dataset
 from transformers import (
-    AutoModelForSequenceClassification,
     TrainingArguments, 
-    PreTrainedTokenizerFast
+    PreTrainedTokenizerFast,
+    GPT2Config,
+    GPT2ForSequenceClassification
 )
 from trl import RewardTrainer
 import random
@@ -92,7 +91,7 @@ class RewardModelTrainer:
     
     def __init__(
         self,
-        base_model_name: str,
+        base_model_name: str = None,  # 奖励模型不需要预训练模型
         tokenizer_path: str = None,
         output_dir: str = "./reward_model",
         max_length: int = 1024
@@ -112,29 +111,29 @@ class RewardModelTrainer:
         
         # 加载分词器
         print(f"使用自定义分词器: {self.tokenizer_path}")
-        self.tokenizer = PreTrainedTokenizerFast(
-            tokenizer_file=self.tokenizer_path,
-            bos_token="<s>", 
-            pad_token="<pad>", 
-            eos_token="</s>", 
-            unk_token="<unk>"
-        )
-        print(f"加载基础模型: {self.base_model_name}")
-
-        # 加载模型用于序列分类（输出单个奖励分数）
-        self.model = AutoModelForSequenceClassification.from_pretrained(
-            self.base_model_name,
+        self.tokenizer = PreTrainedTokenizerFast(tokenizer_file=self.tokenizer_path)
+        
+        # 奖励模型得我架构要与预训练模型相同
+        print("初始化奖励模型（随机权重）...")    
+        config = GPT2Config(
+            vocab_size=32000,
+            n_positions=2048,
+            n_embd=768,
+            n_layer=12,
+            n_head=12,
+            activation_function="gelu_new",
+            resid_pdrop=0.1,
+            embd_pdrop=0.1,
+            attn_pdrop=0.1,
             num_labels=1,  # 输出一个奖励分数
-            torch_dtype=torch.float16,
-            device_map="auto",
-            trust_remote_code=True,
+            pad_token_id=self.tokenizer.pad_token_id
         )
         
-        # 确保模型有正确的pad_token_id，因为RewardTrainer后续会进行padding，如果模型没有pad token会报错
-        if self.model.config.pad_token_id is None:
-            self.model.config.pad_token_id = self.tokenizer.pad_token_id
+        # 模型最终的输出为[batch, num_labels]，表示每个样本的奖励分数
+        self.model = GPT2ForSequenceClassification(config)
         
-        print("奖励模型加载完成！")
+        print("奖励模型初始化完成！（使用随机权重）")
+        print(f"参数量: {sum(p.numel() for p in self.model.parameters())/1e6:.2f}M")
     
     def prepare_dataset(self, dataset_name="openbmb/UltraFeedback", max_samples=None):
         """准备训练数据集 - 使用UltraFeedback数据集"""
@@ -207,10 +206,10 @@ class RewardModelTrainer:
         
         print("开始训练奖励模型...")
         trainer.train()
-        
+
         print("保存奖励模型...")
         trainer.save_model()
-        self.tokenizer.save_pretrained(self.output_dir)
+        # self.tokenizer.save_pretrained(self.output_dir)
         
         return trainer
 
@@ -218,13 +217,12 @@ def main():
     """主函数"""
     print("开始训练奖励模型...")
     
-    # 配置
-    base_model_name = "../qlora_chatbot_model_trl"  # 请替换为您的SFT模型路径
+    # 配置 - 奖励模型不需要base_model_name，使用随机初始化
     tokenizer_path = "../tokenizer/byte_level_bpe_tokenizer_v1.json"  # 自定义分词器
     
     # 初始化训练器
     reward_trainer = RewardModelTrainer(
-        base_model_name=base_model_name,
+        base_model_name=None,  # 不需要预训练模型
         tokenizer_path=tokenizer_path,
         output_dir="./reward_model",
         max_length=1024

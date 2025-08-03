@@ -169,13 +169,7 @@ class QLoRATrainerTRL:
         )
         
         # 加载分词器 - 使用自定义的字节级BPE分词器
-        self.tokenizer = PreTrainedTokenizerFast(
-            tokenizer_file=self.tokenizer_path,
-            bos_token="<s>", 
-            pad_token="<pad>", 
-            eos_token="</s>", 
-            unk_token="<unk>"
-        )
+        self.tokenizer = PreTrainedTokenizerFast(tokenizer_file=self.tokenizer_path)
 
         # 确保模型config与分词器token设置一致
         if self.model.config.pad_token_id is None:
@@ -295,10 +289,22 @@ class QLoRATrainerTRL:
         print("开始TRL SFT训练...")
         trainer.train()
         
-        # 保存最终模型
-        print("保存模型...")
+        # 在模型被get_peft_model包装后，trainer.save_model()只保存LoRA适配器
+        # 因为我后边还要用这个模型来训练奖励模型并且作为强化学习微调的策略模型，所以我选择了合并LORA权重,直接加载更方便
+        print("保存LoRA适配器...")
         trainer.save_model()
-        self.tokenizer.save_pretrained(self.output_dir)
+        
+        # 保存合并后的完整模型（推荐用于后续使用）
+        print("合并并保存完整模型...")
+        merged_model_dir = f"{self.output_dir}_merged"
+        os.makedirs(merged_model_dir, exist_ok=True)
+        
+        # 合并LoRA权重到基础模型
+        merged_model = self.model.merge_and_unload()
+        merged_model.save_pretrained(merged_model_dir)
+        # self.tokenizer.save_pretrained(merged_model_dir)
+        
+        print(f"完整模型已保存到: {merged_model_dir}")
         
         if use_wandb:
             wandb.finish()
@@ -368,7 +374,9 @@ def main():
     )
     
     print("SFT训练完成！")
-    print(f"模型已保存到: {trainer.output_dir}")
+    print(f"LoRA适配器已保存到: {trainer.output_dir}")
+    print(f"完整模型已保存到: {trainer.output_dir}_merged")
+    
 
 if __name__ == "__main__":
     main()
