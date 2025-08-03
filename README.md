@@ -77,3 +77,4 @@ deepspeed --num_gpus=4 model.py
 
 - 4张3090/4090显卡，单卡24GB显存。
 - 内存256GB。
+- hai
