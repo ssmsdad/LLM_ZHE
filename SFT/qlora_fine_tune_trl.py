@@ -19,11 +19,10 @@ import torch
 from datasets import Dataset, load_dataset
 from transformers import (
     AutoModelForCausalLM,
-    TrainingArguments,
     BitsAndBytesConfig,
     PreTrainedTokenizerFast,
 )
-from trl import SFTTrainer
+from trl import SFTTrainer, SFTConfig
 from peft import (
     LoraConfig,
     get_peft_model,
@@ -100,33 +99,32 @@ def process_chatbot_arena_dataset(dataset, tokenizer, max_length: int = 1024) ->
     return processed_dataset
 
 # 如果使用transformers的Trainer，则需要手动处理文本和标签，我这里是没有用的
-def tokenize_function(self, examples):
-    """分词函数"""
-    # 在文本末尾添加EOS token </s>
-    texts = [text + self.tokenizer.eos_token for text in examples["text"]]
+# def tokenize_function(self, examples):
+#     """分词函数"""
+#     # 在文本末尾添加EOS token </s>
+#     texts = [text + self.tokenizer.eos_token for text in examples["text"]]
     
-    #这里的tokenized是一个batch的结果
-    tokenized = self.tokenizer(
-        texts,
-        truncation=True,
-        padding=False,
-        max_length=self.max_seq_length,
-        return_overflowing_tokens=False,    # 超过maxseq_length的文本将被丢弃
-    )
+#     #这里的tokenized是一个batch的结果
+#     tokenized = self.tokenizer(
+#         texts,
+#         truncation=True,
+#         padding=False,
+#         max_length=self.max_seq_length,
+#         return_overflowing_tokens=False,    # 超过maxseq_length的文本将被丢弃
+#     )
     
-    # 对于因果语言模型，labels应该是input_ids向右移动一位
-    # input_ids: [token1, token2, token3, ..., tokenN]
-    # labels:    [token2, token3, ..., tokenN, EOS]
-    labels = []
-    for input_ids in tokenized["input_ids"]:
-        # 创建向右移动一位的labels
-        label = input_ids[1:] + [self.tokenizer.eos_token_id]
-        labels.append(label)
+#     # 对于因果语言模型，labels应该是input_ids向右移动一位
+#     # input_ids: [token1, token2, token3, ..., tokenN]
+#     # labels:    [token2, token3, ..., tokenN, EOS]
+#     labels = []
+#     for input_ids in tokenized["input_ids"]:
+#         # 创建向右移动一位的labels
+#         label = input_ids[1:] + [self.tokenizer.eos_token_id]
+#         labels.append(label)
     
-    tokenized["labels"] = labels
+#     tokenized["labels"] = labels
     
-    return tokenized
-
+#     return tokenized
 
 class QLoRATrainerTRL:
     """基于TRL SFTTrainer的QLoRA微调训练器"""
@@ -135,7 +133,7 @@ class QLoRATrainerTRL:
         self,
         model_name: str,
         tokenizer_path: str = "../tokenizer/byte_level_bpe_tokenizer_v1.json",
-        output_dir: str = "./qlora_chatbot_model_trl",
+        output_dir: str = "./sft_output",
         max_seq_length: int = 1024,
     ):
         self.model_name = model_name
@@ -152,28 +150,42 @@ class QLoRATrainerTRL:
         """设置模型和分词器"""
         print(f"加载模型: {self.model_name}")
         
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
         # 配置4bit量化
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_compute_dtype=torch.float16,  # 改为float16避免数据类型不匹配
         )
-        
-        # 加载模型
+
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
             quantization_config=bnb_config,
-            device_map="auto",
+            # device_map={'': torch.cuda.current_device()},  # 4bit量化必须指定单一设备
+            device_map={"": local_rank},   # <---- 关键
             trust_remote_code=True,
+            torch_dtype=torch.float16,  # 明确数据类型
         )
         
-        # 加载分词器 - 使用自定义的字节级BPE分词器
-        self.tokenizer = PreTrainedTokenizerFast(tokenizer_file=self.tokenizer_path)
-
+        # 加载分词器 - 使用自定义的字节级BPE分词器，确保设置了所有必要的特殊token
+        self.tokenizer = PreTrainedTokenizerFast(
+            tokenizer_file=self.tokenizer_path,
+            bos_token="<s>", 
+            pad_token="<pad>", 
+            eos_token="</s>", 
+            unk_token="<unk>",
+        )
+        
         # 确保模型config与分词器token设置一致
         if self.model.config.pad_token_id is None:
             self.model.config.pad_token_id = self.tokenizer.pad_token_id
+        
+        # 验证特殊token
+        print(f"分词器配置: pad_token_id={self.tokenizer.pad_token_id}, vocab_size={self.tokenizer.vocab_size}")
+        if self.tokenizer.pad_token_id >= self.tokenizer.vocab_size:
+            raise ValueError(f"Pad token ID超出词汇表范围: {self.tokenizer.pad_token_id} >= {self.tokenizer.vocab_size}")
 
         '''
         prepare_model_for_kbit_training：
@@ -188,9 +200,7 @@ class QLoRATrainerTRL:
             r=8,  # 小模型使用较小的rank，避免过参数化
             lora_alpha=16,  # 相应减小alpha scaling
             target_modules=[
-                "q_proj", "k_proj", "v_proj", "o_proj",  # 注意力层
-                # 对于0.1B模型，可能不包含gate_proj, up_proj, down_proj
-                # 如果模型报错，可以只保留注意力层
+                "c_attn", "c_proj"  # GPT-2注意力层
             ],
             lora_dropout=0.05,  # 小模型降低dropout，保持学习能力
             bias="none",
@@ -201,7 +211,7 @@ class QLoRATrainerTRL:
         self.model = get_peft_model(self.model, lora_config)
         self.model.print_trainable_parameters()
     
-    def formatting_func(self, examples):
+    def formatting_func(self, example):
         """
         TRL SFTTrainer的格式化函数（当前未使用）
         如果需要复杂的数据预处理，可以使用此函数替代dataset_text_field
@@ -210,7 +220,7 @@ class QLoRATrainerTRL:
         - 如果数据需要复杂格式化：使用formatting_func参数
         - 如果数据字段简单直接：使用dataset_text_field参数（当前使用）
         """
-        return examples["text"]
+        return example["text"]
 
     
     def train(
@@ -244,9 +254,8 @@ class QLoRATrainerTRL:
                     "packing": packing,
                 }
             )
-        
-        # 设置训练参数
-        training_args = TrainingArguments(
+            
+        sft_config = SFTConfig(
             output_dir=self.output_dir,
             num_train_epochs=num_train_epochs,
             per_device_train_batch_size=per_device_train_batch_size,
@@ -254,35 +263,32 @@ class QLoRATrainerTRL:
             gradient_accumulation_steps=gradient_accumulation_steps,
             warmup_steps=warmup_steps,
             learning_rate=learning_rate,
-            bf16=True,  # 使用bfloat16
             logging_steps=logging_steps,
             save_steps=save_steps,
             eval_steps=eval_steps if eval_dataset is not None else None,
-            evaluation_strategy="steps" if eval_dataset is not None else "no",
-            save_strategy="steps",
-            load_best_model_at_end=True if eval_dataset is not None else False,         # 加载损失最小的检查点
-            metric_for_best_model="eval_loss" if eval_dataset is not None else None,        # 用验证损失作为选择标准
-            greater_is_better=False,        # eval_loss越小越好
+            eval_strategy=("steps" if eval_dataset is not None else "no"),
+            save_strategy=("steps" if eval_dataset is not None else "no"),
+            load_best_model_at_end=True if eval_dataset is not None else False,
+            metric_for_best_model="eval_loss" if eval_dataset is not None else None,
+            greater_is_better=False,
             report_to="wandb" if use_wandb else "none",
             run_name=f"qlora-trl-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
-            dataloader_pin_memory=False,        # 将数据在常规内存中，而不是固定内存中，GPU读取稍慢但节省内存
+            dataloader_pin_memory=False,
             remove_unused_columns=False,
-            # TRL特定参数
-            group_by_length=True,  # 按长度分组，提高效率
+            max_length=self.max_seq_length,
+            dataset_text_field="text",
+            packing=packing,
+            fp16=False,  # 启用fp16与量化配置匹配
+            bf16=False,  # 禁用bf16
         )
-        
-        # 创建TRL SFT训练器
+            
+
         trainer = SFTTrainer(
             model=self.model,
-            args=training_args,
+            args=sft_config,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
-            tokenizer=self.tokenizer,
-            # TRL SFTTrainer特有参数
-            dataset_text_field="text",  # 直接指定数据集中的文本字段名
-            max_seq_length=self.max_seq_length,  # 最大序列长度
-            packing=packing,  # 是否启用packing优化
-            # 使用dataset_text_field时，SFTTrainer会自动从指定字段读取文本并自动添加EOS token
+            processing_class=self.tokenizer,
         )
         
         # 开始训练
@@ -353,7 +359,7 @@ def main():
     trainer = QLoRATrainerTRL(
         model_name=model_name,
         tokenizer_path=tokenizer_path,
-        output_dir="./qlora_chatbot_model_trl",
+        output_dir="./sft_output",
         max_seq_length=1024,
     )
     
@@ -361,16 +367,16 @@ def main():
     trainer.train(
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        num_train_epochs=3,
-        learning_rate=2e-4,
-        per_device_train_batch_size=2,  # 根据显存调整
-        gradient_accumulation_steps=8,  # 有效batch size = 2 * 8 = 16
-        warmup_steps=100,
+        num_train_epochs=2,  # 🔧 减少训练轮数，避免过拟合
+        learning_rate=1e-4,  # 🔧 降低学习率，更温和的微调
+        per_device_train_batch_size=1,  # 避免padding问题，但通过多GPU并行提高吞吐
+        gradient_accumulation_steps=16,  # 保持有效batch size
+        warmup_steps=100,  # 🔧 减少warmup步数
         logging_steps=10,
         save_steps=200,
         eval_steps=200,
         use_wandb=False,  # 设置为True如果要使用wandb
-        packing=False,  # 可以尝试设置为True提高效率
+        packing=False,  # 禁用packing，避免序列长度问题
     )
     
     print("SFT训练完成！")

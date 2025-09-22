@@ -135,8 +135,8 @@ training_args = TrainingArguments(
     output_dir="./output",
     overwrite_output_dir=True,
     max_steps=200000,  # 只训练20万步,设置steps而不是epochs更适合大规模数据集
-    per_device_train_batch_size=16,  # 稍微减小到20，避免显存瓶颈
-    gradient_accumulation_steps=8,   # 保持梯度累积，总batch size=20*4*6=480
+    per_device_train_batch_size=16, 
+    gradient_accumulation_steps=8,   
     save_steps=10000,
     save_total_limit=3,
     logging_steps=50,
@@ -147,7 +147,7 @@ training_args = TrainingArguments(
     weight_decay=0.01,  # 添加权重衰减
     gradient_checkpointing=True,
     dataloader_pin_memory=True,  
-    dataloader_num_workers=4,     # 减少到6个进程，避免CPU瓶颈
+    dataloader_num_workers=4,    
     deepspeed="ds_config.json",
     report_to=["none"],  
 )

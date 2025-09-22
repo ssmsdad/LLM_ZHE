@@ -202,5 +202,10 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+# Model files and outputs
 output/
+*output/
+*_output/
+*_output_new/
+*_output_merged/
 pretrain_data_chunks/

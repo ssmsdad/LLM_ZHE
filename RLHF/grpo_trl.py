@@ -12,24 +12,19 @@ import os
 # 设置环境变量
 os.environ['HF_DATASETS_CACHE'] = '/data/wenzhe/huggingface/datasets'
 os.environ['HF_HOME'] = '/data/wenzhe/huggingface'
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'  # 避免多进程tokenizer警告
 import torch
 from datasets import load_dataset
 from transformers import (
     AutoModelForCausalLM,
-    TrainingArguments,
     BitsAndBytesConfig,
     PreTrainedTokenizerFast,
     AutoModelForSequenceClassification
 )
 from trl import GRPOTrainer, GRPOConfig
-from peft import (
-    LoraConfig,
-    get_peft_model,
-    TaskType,
-    prepare_model_for_kbit_training,
-)
+from peft import PeftModel
 import random
-from typing import Dict, List
+from typing import List
 import multiprocessing
 
 num_proc = max(1, multiprocessing.cpu_count() // 2)
@@ -39,13 +34,15 @@ class GRPOTrainerTRL:
     
     def __init__(
         self,
-        sft_model_path: str,
+        base_model_path: str,
+        adapter_path: str,
         reward_model_path: str,
         tokenizer_path: str = "../tokenizer/byte_level_bpe_tokenizer_v1.json",
         output_dir: str = "./grpo_model_trl",
         max_length: int = 1024,
     ):
-        self.sft_model_path = sft_model_path
+        self.base_model_path = base_model_path
+        self.sft_model_path = adapter_path
         self.reward_model_path = reward_model_path
         self.tokenizer_path = tokenizer_path
         self.output_dir = output_dir
@@ -61,7 +58,15 @@ class GRPOTrainerTRL:
         print("Loading model and tokenizer...")
         
         # 加载分词器
-        self.tokenizer = PreTrainedTokenizerFast(tokenizer_file=self.tokenizer_path)
+        self.tokenizer = PreTrainedTokenizerFast(
+            tokenizer_file=self.tokenizer_path,
+            bos_token="<s>", 
+            pad_token="<pad>", 
+            eos_token="</s>", 
+            unk_token="<unk>",
+        )
+
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))   # 每个进程只在自己的 GPU 上放一份完整模型
         
         # 配置4bit量化
         bnb_config = BitsAndBytesConfig(
@@ -72,11 +77,12 @@ class GRPOTrainerTRL:
         )
         
         # 加载策略模型（SFT模型）
-        print(f"Loading policy model: {self.sft_model_path}")
+        print(f"Loading policy model: {self.base_model_path}")
         self.model = AutoModelForCausalLM.from_pretrained(
-            self.sft_model_path,
+            self.base_model_path,
             quantization_config=bnb_config,
-            device_map="auto",
+            device_map={"": torch.device(f"cuda:{local_rank}")},   # 固定到当前进程的卡
+            # device_map={"": local_rank},   # <---- 关键
             trust_remote_code=True,
             torch_dtype=torch.bfloat16,
         )
@@ -85,34 +91,31 @@ class GRPOTrainerTRL:
         if self.model.config.pad_token_id is None:
             self.model.config.pad_token_id = self.tokenizer.pad_token_id
         
-        # 添加LoRA适配器
-        self.model = prepare_model_for_kbit_training(self.model)
+        # 加载SFT适配器到基础模型上
+        self.ft_model = PeftModel.from_pretrained(self.model, self.sft_model_path)
         
-        lora_config = LoraConfig(
-            r=8,
-            lora_alpha=16,
-            target_modules=[
-                "q_proj", "k_proj", "v_proj", "o_proj",
-            ],
-            lora_dropout=0.05,
-            bias="none",
-            task_type=TaskType.CAUSAL_LM,
-        )
-        
-        self.model = get_peft_model(self.model, lora_config)
-        self.model.print_trainable_parameters()
+        # 确保LoRA参数可训练（重要！）
+        self.ft_model.train()
+        for name, param in self.ft_model.named_parameters():
+            if 'lora_' in name:
+                param.requires_grad = True
+
 
         print(f"Loading reward model: {self.reward_model_path}")
         self.reward_model = AutoModelForSequenceClassification.from_pretrained(
             self.reward_model_path,
             torch_dtype=torch.bfloat16,
-            device_map="auto",
+            device_map={"": torch.device(f"cuda:{local_rank}")},   # 固定到当前进程的卡
+            # device_map={"": local_rank},   # <---- 关键
             trust_remote_code=True,
         )
         
         print("All Model and tokenizer loaded successfully!")
+        trainable = sum(p.numel() for p in self.ft_model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self.ft_model.parameters())
+        print(f"Trainable parameters: {trainable}/{total} ({100*trainable/total:.2f}%)")
     
-    def prepare_dataset(self, dataset_name="vicgalle/alpaca-gpt4", max_samples=1000):
+    def prepare_dataset(self, dataset_name="vicgalle/alpaca-gpt4",max_samples=None):
         """准备GRPO训练数据集 - 适配alpaca-gpt4格式"""
         print(f"Loading dataset: {dataset_name}")
         
@@ -139,18 +142,37 @@ class GRPOTrainerTRL:
                 else:
                     prompt = instruction
                 
+                # 严格限制prompt长度，防止形状错误
+                # 先用字符长度粗略过滤
+                if len(prompt) > 1500:  # 字符长度限制
+                    prompt = prompt[:1500]
+                
+                # 再用分词器精确截断
+                try:
+                    prompt_tokens = self.tokenizer(
+                        prompt, 
+                        max_length=350,  # 更严格的token限制
+                        truncation=True,
+                        add_special_tokens=False
+                    )['input_ids']
+                    prompt = self.tokenizer.decode(prompt_tokens, skip_special_tokens=True)
+                except Exception as e:
+                    # 如果分词出错，使用字符截断
+                    print(f"Tokenization error, using character truncation: {e}")
+                    prompt = prompt[:500]
+                
                 prompts.append(prompt.strip())
             
             return {"prompt": prompts}
         
-        # 使用map批处理，大幅提升速度
+        # 使用map批处理，禁用多进程避免CUDA冲突
         processed_dataset = train_dataset.map(
             process_alpaca_batch,
             batched=True,
             batch_size=1000,  # 每批处理1000个样本
             remove_columns=train_dataset.column_names,  # 删除原始列
             desc="Processing Alpaca-GPT4 dataset",  # 显示进度条
-            num_proc=num_proc,  # 使用多进程加速
+            num_proc=1,  # 禁用多进程，避免CUDA重初始化错误
         )
         
         print(f"Prepared {len(processed_dataset)} training samples")
@@ -159,7 +181,27 @@ class GRPOTrainerTRL:
     def create_reward_function(self):
         """创建奖励函数"""
         
-        def reward_function(prompts: List[str], responses: List[str]) -> List[float]:
+        def reward_function(*args, **kwargs) -> List[float]:
+            """
+            奖励函数 - 兼容TRL GRPOTrainer的多种调用方式
+            支持：
+            - reward_function(prompts, responses)
+            - reward_function(prompts=..., responses=..., completions=...)
+            - 其他TRL可能的调用方式
+            """
+            # 解析参数
+            if len(args) >= 2:
+                # 位置参数调用: reward_function(prompts, responses)
+                prompts, responses = args[0], args[1]
+            elif 'prompts' in kwargs and 'responses' in kwargs:
+                # 关键字参数调用: reward_function(prompts=..., responses=...)
+                prompts, responses = kwargs['prompts'], kwargs['responses']
+            elif 'prompts' in kwargs and 'completions' in kwargs:
+                # 新版TRL可能的调用方式
+                prompts, responses = kwargs['prompts'], kwargs['completions']
+            else:
+                raise ValueError(f"Invalid reward function call: args={args}, kwargs={kwargs}")
+            
             rewards = []
             
             for prompt, response in zip(prompts, responses):
@@ -180,7 +222,7 @@ class GRPOTrainerTRL:
                 with torch.no_grad():
                     outputs = self.reward_model(**inputs)
                     # 奖励模型输出单个分数 [batch_size, 1]
-                    reward_score = outputs.logits[0, 0].item()
+                    reward_score = outputs.logits.squeeze().item()
                     rewards.append(reward_score)
             
             return rewards
@@ -194,7 +236,7 @@ class GRPOTrainerTRL:
         learning_rate: float = 1e-6,
         per_device_train_batch_size: int = 1,
         gradient_accumulation_steps: int = 8,
-        max_new_tokens: int = 150,
+        max_new_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
         logging_steps: int = 10,
@@ -209,45 +251,43 @@ class GRPOTrainerTRL:
         # 配置GRPO训练参数
         grpo_config = GRPOConfig(
             learning_rate=learning_rate,
-            batch_size=per_device_train_batch_size * gradient_accumulation_steps,
-            mini_batch_size=per_device_train_batch_size,
+            output_dir=self.output_dir,
+            per_device_train_batch_size=per_device_train_batch_size,
+            per_device_eval_batch_size=per_device_train_batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
-            max_new_tokens=max_new_tokens,
+            max_completion_length=max_new_tokens,
             temperature=temperature,
             top_p=top_p,
-            # GRPO特定参数
-            rpo_alpha=1.0,  # 相对策略优化的权重
-            use_score_scaling=True,  # 使用分数缩放
-            score_clip=5.0,  # 分数裁剪范围
-        )
-        
-        # 训练参数
-        training_args = TrainingArguments(
-            output_dir=self.output_dir,
             num_train_epochs=num_train_epochs,
-            per_device_train_batch_size=per_device_train_batch_size,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            learning_rate=learning_rate,
             logging_steps=logging_steps,
             save_steps=save_steps,
             eval_steps=eval_steps,
-            bf16=True,
+            report_to="none",
+            # GRPO特有参数
+            beta=0.3,  # GRPO的重要参数，控制policy和reference model的差异
+            # scale_rewards=True,  # 是否缩放奖励
+            # 防止形状错误的配置
             remove_unused_columns=False,
-            report_to="none",  # 可以改为"wandb"如果需要
+            dataloader_drop_last=True,
+            ignore_data_skip=True,  # 跳过有问题的数据
+            # 明确指定从最新检查点恢复
+            resume_from_checkpoint="./grpo_model_output/checkpoint-4000",
         )
-        
-        # 创建GRPO训练器
+
+        # 创建GRPO训练器（新版接口）
         trainer = GRPOTrainer(
-            model=self.model,
-            args=training_args,
-            grpo_config=grpo_config,
+            model=self.ft_model,
+            reward_funcs=reward_fn,  # 这里是函数或函数列表
+            args=grpo_config,
             train_dataset=train_dataset,
-            tokenizer=self.tokenizer,
-            reward_function=reward_fn,
+            processing_class=self.tokenizer,  # 主tokenizer
+            reward_processing_classes=self.tokenizer,  # 奖励模型tokenizer
         )
+
         
         # 开始训练
         print("Starting GRPO training with TRL GRPOTrainer...")
+        # trainer.train(resume_from_checkpoint="./grpo_model_output/checkpoint-7000")
         trainer.train()
         
         # 保存最终模型
@@ -259,26 +299,26 @@ class GRPOTrainerTRL:
 
 def main():
     """主函数"""
-    print("Starting GRPO training with TRL GRPOTrainer...")
-    
     # 配置路径
-    sft_model_path = "../SFT/qlora_chatbot_model_trl"  # SFT模型路径
-    reward_model_path = "./reward_model"  # 奖励模型路径
+    base_model_path = "../output"  # 基础模型路径
+    adapter_path = "../SFT/sft_output"  # SFT模型路径
+    reward_model_path = "./reward_model_output"  # 奖励模型路径
     tokenizer_path = "../tokenizer/byte_level_bpe_tokenizer_v1.json"
     
     # 初始化GRPO训练器
     grpo_trainer = GRPOTrainerTRL(
-        sft_model_path=sft_model_path,
+        base_model_path=base_model_path,
+        adapter_path=adapter_path,
         reward_model_path=reward_model_path,
         tokenizer_path=tokenizer_path,
-        output_dir="./grpo_model_trl",
+        output_dir="./grpo_model_output_new",
         max_length=1024,
     )
-    
     # 准备数据集
     train_dataset = grpo_trainer.prepare_dataset(
         dataset_name="vicgalle/alpaca-gpt4",
-        max_samples=200  # 小规模测试
+        # max_samples=20000  # 小规模测试
+        max_samples=2000  # 小规模测试
     )
     
     # 开始训练
@@ -286,21 +326,17 @@ def main():
         train_dataset=train_dataset,
         num_train_epochs=2,
         learning_rate=1e-6,
-        per_device_train_batch_size=1,  # 根据显存调整
+        per_device_train_batch_size=2, 
         gradient_accumulation_steps=8,
-        max_new_tokens=150,
+        max_new_tokens=256,
         temperature=0.7,
         top_p=0.9,
-        logging_steps=5,
-        save_steps=100,
+        logging_steps=50,
+        save_steps=500,
     )
     
     print("GRPO training completed!")
     print(f"Model saved to: {grpo_trainer.output_dir}")
-    
-    print("Next steps:")
-    print("- Test the final GRPO model performance")
-    print("- Compare with SFT model to see improvements")
 
 if __name__ == "__main__":
     main()

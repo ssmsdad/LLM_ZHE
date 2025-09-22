@@ -143,7 +143,7 @@ def interactive_chat(model, tokenizer):
 def main():
     """主函数"""
     # 模型路径 - 如果训练完成，使用output根目录；否则使用最新checkpoint
-    model_path = "./output/checkpoint-30000" 
+    model_path = "../output" 
     
     try:
         # 加载模型
@@ -155,10 +155,10 @@ def main():
         print(f"Device: {model.device}")
         
         # Automated testing
-        test_model_capabilities(model, tokenizer)
+        # test_model_capabilities(model, tokenizer)
         
         # Interactive testing
-        # interactive_chat(model, tokenizer)
+        interactive_chat(model, tokenizer)
         
     except Exception as e:
         print(f"Error loading model: {e}")
